@@ -54,7 +54,7 @@ type NSQD struct {
 
 func NewNSQD(opts *nsqdOptions) *NSQD {
 	var httpsAddr *net.TCPAddr
-
+// 参数校验开始
 	if opts.MaxDeflateLevel < 1 || opts.MaxDeflateLevel > 9 {
 		log.Fatalf("--max-deflate-level must be [1,9]")
 	}
@@ -62,7 +62,9 @@ func NewNSQD(opts *nsqdOptions) *NSQD {
 	if opts.ID < 0 || opts.ID >= 4096 {
 		log.Fatalf("--worker-id must be [0,4096)")
 	}
+// 结束
 
+// 三个监听地址
 	tcpAddr, err := net.ResolveTCPAddr("tcp", opts.TCPAddress)
 	if err != nil {
 		log.Fatal(err)
@@ -79,7 +81,9 @@ func NewNSQD(opts *nsqdOptions) *NSQD {
 			log.Fatal(err)
 		}
 	}
+// TCP，HTTP和HTTPS三个监听地址处理完成
 
+// 由IP:Port生成一个标志
 	if opts.StatsdPrefix != "" {
 		statsdHostKey := util.StatsdHostKey(net.JoinHostPort(opts.BroadcastAddress,
 			strconv.Itoa(httpAddr.Port)))
@@ -100,7 +104,7 @@ func NewNSQD(opts *nsqdOptions) *NSQD {
 		idChan:     make(chan MessageID, 4096),
 		exitChan:   make(chan int),
 		notifyChan: make(chan interface{}),
-		tlsConfig:  buildTLSConfig(opts),
+		tlsConfig:  buildTLSConfig(opts),		// 在这里加载TLS密钥信息
 	}
 
 	n.waitGroup.Wrap(func() { n.idPump() })
@@ -142,7 +146,7 @@ func (n *NSQD) GetHealth() string {
 func (n *NSQD) Main() {
 	var httpListener net.Listener
 	var httpsListener net.Listener
-
+// 向监听服务器添加logger
 	ctx := &context{n, n.opts.Logger}
 
 	if n.opts.TLSClientAuthPolicy != "" {
@@ -154,7 +158,7 @@ func (n *NSQD) Main() {
 	}
 
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
-
+// tcpListener用来监听端口，tcpServer用来Handle客户端的clientConnection，TCPServer将循环accept前者的请求并交由后者处理。
 	tcpListener, err := net.Listen("tcp", n.tcpAddr.String())
 	if err != nil {
 		log.Fatalf("FATAL: listen (%s) failed - %s", n.tcpAddr, err.Error())
@@ -164,7 +168,7 @@ func (n *NSQD) Main() {
 	n.waitGroup.Wrap(func() {
 		util.TCPServer(n.tcpListener, tcpServer, n.opts.Logger)
 	})
-
+// HTTPS用tls配置建立listener，server使用httpserver加tls使能
 	if n.tlsConfig != nil && n.httpsAddr != nil {
 		httpsListener, err = tls.Listen("tcp", n.httpsAddr.String(), n.tlsConfig)
 		if err != nil {
@@ -180,6 +184,7 @@ func (n *NSQD) Main() {
 			util.HTTPServer(n.httpsListener, httpsServer, n.opts.Logger, "HTTPS")
 		})
 	}
+// HTTP服务
 	httpListener, err = net.Listen("tcp", n.httpAddr.String())
 	if err != nil {
 		log.Fatalf("FATAL: listen (%s) failed - %s", n.httpAddr, err.Error())
@@ -199,6 +204,7 @@ func (n *NSQD) Main() {
 	}
 }
 
+// 取出meta中保存的topic列表，检查名称有效性并新建topic恢复现场，对每个topic同样恢复其channel
 func (n *NSQD) LoadMetadata() {
 	fn := fmt.Sprintf(path.Join(n.opts.DataPath, "nsqd.%d.dat"), n.opts.ID)
 	data, err := ioutil.ReadFile(fn)
@@ -330,6 +336,7 @@ func (n *NSQD) PersistMetadata() error {
 }
 
 func (n *NSQD) Exit() {
+// 退出时先关闭监听
 	if n.tcpListener != nil {
 		n.tcpListener.Close()
 	}
@@ -341,7 +348,7 @@ func (n *NSQD) Exit() {
 	if n.httpsListener != nil {
 		n.httpsListener.Close()
 	}
-
+// 持久化数据
 	n.Lock()
 	err := n.PersistMetadata()
 	if err != nil {
@@ -356,11 +363,14 @@ func (n *NSQD) Exit() {
 	// we want to do this last as it closes the idPump (if closed first it
 	// could potentially starve items in process and deadlock)
 	close(n.exitChan)
+// 关闭exitChan会使得等待这个chan的routine得到信号，然后等待三个监听彻底关闭和idPump完成
 	n.waitGroup.Wait()
 }
 
 // GetTopic performs a thread safe operation
 // to return a pointer to a Topic object (potentially new)
+
+// GetTopic会新建不存在的topic。
 func (n *NSQD) GetTopic(topicName string) *Topic {
 	n.Lock()
 	t, ok := n.topicMap[topicName]
@@ -379,6 +389,8 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 		n.Unlock()
 		// if using lookupd, make a blocking call to get the topics, and immediately create them.
 		// this makes sure that any message received is buffered to the right channels
+
+// Lookup部分待看
 		if len(n.lookupPeers) > 0 {
 			channelNames, _ := lookupd.GetLookupdTopicChannels(t.name, n.lookupHttpAddrs())
 			for _, channelName := range channelNames {
@@ -401,6 +413,8 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	return t
 }
 
+
+// GetExistingTopic不会新建不存在的Topic
 // GetExistingTopic gets a topic only if it exists
 func (n *NSQD) GetExistingTopic(topicName string) (*Topic, error) {
 	n.RLock()
@@ -428,6 +442,8 @@ func (n *NSQD) DeleteExistingTopic(topicName string) error {
 	// we do this before removing the topic from map below (with no lock)
 	// so that any incoming writes will error and not create a new topic
 	// to enforce ordering
+
+// 先删除topic再解除注册，否则新来的请求会自动注册topic从而错误delete后创建的topic
 	topic.Delete()
 
 	n.Lock()
@@ -438,6 +454,8 @@ func (n *NSQD) DeleteExistingTopic(topicName string) error {
 }
 
 func (n *NSQD) idPump() {
+
+// 循环生产全局唯一id，并注入idChan供其他routine使用
 	factory := &guidFactory{}
 	lastError := time.Now()
 	for {
@@ -463,6 +481,7 @@ exit:
 	n.opts.Logger.Output(2, "ID: closing")
 }
 
+// 手动notify的时候持久化数据，通知可能来自topic的new或exit函数
 func (n *NSQD) Notify(v interface{}) {
 	// by selecting on exitChan we guarantee that
 	// we do not block exit, see issue #123

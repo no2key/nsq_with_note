@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 )
-
+// 版本号码解析
 // Version represents a parsed version. See http://semver.org/ for
 // detailed description of the various components.
 type Version struct {

@@ -97,3 +97,5 @@ func (pq *inFlightPqueue) down(i, n int) {
 		i = j
 	}
 }
+
+// 这里的优先级都是用了unixnano时间戳，越小的时间戳离现在越久远，优先级越高。在timeout执行时会把消息的pri加上一个timeout使其增大，降低了它的优先级，实现了延时处理。

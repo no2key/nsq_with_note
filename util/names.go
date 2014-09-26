@@ -22,3 +22,5 @@ func IsValidChannelName(name string) bool {
 	}
 	return validChannelNameRegex.MatchString(name)
 }
+
+// 检验名称有效性

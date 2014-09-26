@@ -48,3 +48,5 @@ func SendFramedResponse(w io.Writer, frameType int32, data []byte) (int, error) 
 	n, err = w.Write(data)
 	return n + 8, err
 }
+
+// protocol接口，和两个静态方法，添加response头用

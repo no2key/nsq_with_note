@@ -55,3 +55,5 @@ func NanoSecondToHuman(v float64) string {
 	}
 	return fmt.Sprintf("%0.1f%s", v, suffix)
 }
+
+// 序数、单位换算和添加千位标号。

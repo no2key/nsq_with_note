@@ -42,6 +42,7 @@ type diskQueue struct {
 	nextReadPos     int64
 	nextReadFileNum int64
 
+// 指针指向的位置，在改写时不会仅改写副本
 	readFile  *os.File
 	writeFile *os.File
 	reader    *bufio.Reader
@@ -51,10 +52,13 @@ type diskQueue struct {
 	readChan chan []byte
 
 	// internal channels
+// writeChan为写入管道，writeResponseChan为写完成的返回通知
 	writeChan         chan []byte
 	writeResponseChan chan error
+// emptyChan为开始empty的通知位，emptyResponseChan为清空完成的返回通知
 	emptyChan         chan int
 	emptyResponseChan chan error
+// exitChan为开始exit的通知位，exitSyncChan为ioLoop完成的返回通知
 	exitChan          chan int
 	exitSyncChan      chan int
 
@@ -188,6 +192,8 @@ func (d *diskQueue) deleteAllFiles() error {
 	return err
 }
 
+
+// 删除原来所有的数据文件并新建，runtime pos计数器归零
 func (d *diskQueue) skipToNextRWFile() error {
 	var err error
 
@@ -228,6 +234,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	var err error
 	var msgSize int32
 
+// 打开读文件并找到读取位置
 	if d.readFile == nil {
 		curFileName := d.fileName(d.readFileNum)
 		d.readFile, err = os.OpenFile(curFileName, os.O_RDONLY, 0600)
@@ -249,6 +256,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		d.reader = bufio.NewReader(d.readFile)
 	}
 
+// 读取二进制存储的msgSize
 	err = binary.Read(d.reader, binary.BigEndian, &msgSize)
 	if err != nil {
 		d.readFile.Close()
@@ -257,6 +265,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	}
 
 	readBuf := make([]byte, msgSize)
+// ReadFull按照buf的大小读取所需的数据，这里是msgSize指定的
 	_, err = io.ReadFull(d.reader, readBuf)
 	if err != nil {
 		d.readFile.Close()
@@ -264,16 +273,21 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		return nil, err
 	}
 
+// 4个字节存储的是msgzise
 	totalBytes := int64(4 + msgSize)
 
 	// we only advance next* because we have not yet sent this to consumers
 	// (where readFileNum, readPos will actually be advanced)
+
+	// 并没有直接移动readPos，而是nextReadPos，因为此时数据并没有真的返回
 	d.nextReadPos = d.readPos + totalBytes
 	d.nextReadFileNum = d.readFileNum
 
 	// TODO: each data file should embed the maxBytesPerFile
 	// as the first 8 bytes (at creation time) ensuring that
 	// the value can change without affecting runtime
+
+	// 超过单文件大小，说明下个数据在下一个文件中，关闭当前并开启新文件
 	if d.nextReadPos > d.maxBytesPerFile {
 		if d.readFile != nil {
 			d.readFile.Close()
@@ -292,6 +306,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 func (d *diskQueue) writeOne(data []byte) error {
 	var err error
 
+// 打开写入文件，找到写入位置
 	if d.writeFile == nil {
 		curFileName := d.fileName(d.writeFileNum)
 		d.writeFile, err = os.OpenFile(curFileName, os.O_RDWR|os.O_CREATE, 0600)
@@ -311,8 +326,9 @@ func (d *diskQueue) writeOne(data []byte) error {
 		}
 	}
 
+// 写入格式 4位的size + 数据
 	dataLen := len(data)
-
+// 写入buf
 	d.writeBuf.Reset()
 	err = binary.Write(&d.writeBuf, binary.BigEndian, int32(dataLen))
 	if err != nil {
@@ -323,7 +339,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 	if err != nil {
 		return err
 	}
-
+// 写入文件
 	// only write to the file once
 	_, err = d.writeFile.Write(d.writeBuf.Bytes())
 	if err != nil {
@@ -331,11 +347,12 @@ func (d *diskQueue) writeOne(data []byte) error {
 		d.writeFile = nil
 		return err
 	}
-
+// 调整写入pos 因为是真的写入了文件，所以这里直接改变的是writePos
 	totalBytes := int64(4 + dataLen)
 	d.writePos += totalBytes
+// 维护depth
 	atomic.AddInt64(&d.depth, 1)
-
+// 大小超过上限，sync当前到磁盘并开新文件写入
 	if d.writePos > d.maxBytesPerFile {
 		d.writeFileNum++
 		d.writePos = 0
@@ -479,6 +496,7 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 	}
 }
 
+// 特定的时候真正移动readPos，并视情况处理readFile文件
 func (d *diskQueue) moveForward() {
 	oldReadFileNum := d.readFileNum
 	d.readFileNum = d.nextReadFileNum
@@ -570,6 +588,7 @@ func (d *diskQueue) ioLoop() {
 
 		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {
 			if d.nextReadPos == d.readPos {
+			// 只有上次读取的数据被取走之后，才进行下一个记录的读取
 				dataRead, err = d.readOne()
 				if err != nil {
 					d.l.Output(2, fmt.Sprintf(
@@ -579,6 +598,7 @@ func (d *diskQueue) ioLoop() {
 					continue
 				}
 			}
+// 下面3行有注释：go语言会忽略nil管道的读写，因此只有有数据（read位置比write位置更靠前）的时候才产生输出用的readChan管道
 			r = d.readChan
 		} else {
 			r = nil
@@ -588,12 +608,16 @@ func (d *diskQueue) ioLoop() {
 		// the Go channel spec dictates that nil channel operations (read or write)
 		// in a select are skipped, we set r to d.readChan only when there is data to read
 		case r <- dataRead:
+			// 取走数据才移动readPos
 			d.moveForward()
 		case <-d.emptyChan:
+			// 清空文件之后发通知
 			d.emptyResponseChan <- d.deleteAllFiles()
 		case dataWrite := <-d.writeChan:
+			// 写入数据后发通知
 			d.writeResponseChan <- d.writeOne(dataWrite)
 		case <-syncTicker.C:
+			// 超时之后允许sync
 			d.needSync = true
 		case <-d.exitChan:
 			goto exit

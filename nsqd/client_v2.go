@@ -96,6 +96,7 @@ type clientV2 struct {
 	SampleRate int32
 
 	IdentifyEventChan chan identifyEvent
+// 这里的SubEvent的Sub是subscribe即事件订阅的意思，不是子事件。怀疑作者母语不是英语。
 	SubEventChan      chan *Channel
 
 	TLS     int32
@@ -122,6 +123,7 @@ func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 
 		Conn: conn,
 
+// 将接受的TCP连接conn绑定到bufio的reader和writer上，缓冲区大小由参数确定，对缓冲区的读写在flush的时候会落地到remote端
 		Reader: bufio.NewReaderSize(conn, defaultBufferSize),
 		Writer: bufio.NewWriterSize(conn, defaultBufferSize),
 
@@ -137,9 +139,11 @@ func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 		ConnectTime:    time.Now(),
 		State:          stateInit,
 
+// identifier和hostname都是consumer客户端的IP地址
 		ClientID: identifier,
 		Hostname: identifier,
 
+// 这两个管道1缓冲的意义：第一次identify和绑定channel一定成功，后续会直接忽略，保证只写入identify和subscribe各一次
 		SubEventChan:      make(chan *Channel, 1),
 		IdentifyEventChan: make(chan identifyEvent, 1),
 
@@ -168,6 +172,7 @@ func (c *clientV2) Identify(data identifyDataV2) error {
 		clientId = data.ShortId
 	}
 
+// 原子性的改写clientID hostname和UA, 由client结构初始化时的默认值改变为identify时提供的值
 	c.Lock()
 	c.ClientID = clientId
 	c.Hostname = hostname
@@ -199,6 +204,7 @@ func (c *clientV2) Identify(data identifyDataV2) error {
 		return err
 	}
 
+// identifyEvent 这个事件由IDENTIFY产生，发送给protocol的messagePump处理
 	ie := identifyEvent{
 		OutputBufferTimeout: c.OutputBufferTimeout,
 		HeartbeatInterval:   c.HeartbeatInterval,
@@ -335,13 +341,16 @@ func (c *clientV2) IsReadyForMessages() bool {
 		c.ctx.l.Output(2, fmt.Sprintf("[%s] state rdy: %4d lastrdy: %4d inflt: %4d", c,
 			readyCount, lastReadyCount, inFlightCount))
 	}
-
+// 没有ready或者当前处理中的消息大于等于ready，则not ready
+// RDY同时设置LastReady和Ready，sendingMessage仅仅减少readyCount。
 	if inFlightCount >= lastReadyCount || readyCount <= 0 {
 		return false
 	}
 
 	return true
 }
+
+// 下面都是维护计数器的值，并通知protocol的messagePump这次更新
 
 func (c *clientV2) SetReadyCount(count int64) {
 	atomic.StoreInt64(&c.ReadyCount, count)
@@ -350,6 +359,8 @@ func (c *clientV2) SetReadyCount(count int64) {
 }
 
 func (c *clientV2) tryUpdateReadyState() {
+	// 一段貌似语法有问题的注释？
+	// 只要ReadyStateChan有一个1就可以了，pump就知道计数器的更新，后续的设置1忽略就可以。
 	// you can always *try* to write to ReadyStateChan because in the cases
 	// where you cannot the message pump loop would have iterated anyway.
 	// the atomic integer operations guarantee correctness of the value.
@@ -370,6 +381,7 @@ func (c *clientV2) Empty() {
 	c.tryUpdateReadyState()
 }
 
+// 其他都是被动接收remote的状态更新，只有这个是主动发message给remote处理时维护的计数器。被messagePump调用
 func (c *clientV2) SendingMessage() {
 	atomic.AddInt64(&c.ReadyCount, -1)
 	atomic.AddInt64(&c.InFlightCount, 1)
@@ -402,6 +414,7 @@ func (c *clientV2) UnPause() {
 	c.tryUpdateReadyState()
 }
 
+// 设置client的几个参数的接口，heartbeatInterval, outputBufferSize, outputBufferTimeout, sampleRate, MsgTimeout
 func (c *clientV2) SetHeartbeatInterval(desiredInterval int) error {
 	c.Lock()
 	defer c.Unlock()
@@ -411,6 +424,7 @@ func (c *clientV2) SetHeartbeatInterval(desiredInterval int) error {
 		c.HeartbeatInterval = 0
 	case desiredInterval == 0:
 		// do nothing (use default)
+	// 接受一定范围的毫秒值
 	case desiredInterval >= 1000 &&
 		desiredInterval <= int(c.ctx.nsqd.opts.MaxHeartbeatInterval/time.Millisecond):
 		c.HeartbeatInterval = time.Duration(desiredInterval) * time.Millisecond
@@ -494,6 +508,7 @@ func (c *clientV2) SetMsgTimeout(msgTimeout int) error {
 	return nil
 }
 
+// 启用TLS或deflate或snappy时，改变remote的连接类型或读写buffer
 func (c *clientV2) UpgradeTLS() error {
 	c.Lock()
 	defer c.Unlock()
@@ -553,6 +568,7 @@ func (c *clientV2) UpgradeSnappy() error {
 
 func (c *clientV2) Flush() error {
 	var zeroTime time.Time
+	// 根据心跳间隔，定期刷新tcp连接。SetWriteDeadline是net包的方法。
 	if c.HeartbeatInterval > 0 {
 		c.SetWriteDeadline(time.Now().Add(c.HeartbeatInterval))
 	} else {
@@ -571,6 +587,7 @@ func (c *clientV2) Flush() error {
 	return nil
 }
 
+// auth相关
 func (c *clientV2) QueryAuthd() error {
 	remoteIp, _, err := net.SplitHostPort(c.String())
 	if err != nil {

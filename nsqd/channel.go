@@ -102,6 +102,7 @@ func NewChannel(topicName string, channelName string, ctx *context,
 
 	c.initPQ()
 
+// #ephemeral结尾的是临时性的channel，backend实际不做任何处理
 	if strings.HasSuffix(channelName, "#ephemeral") {
 		c.ephemeralChannel = true
 		c.backend = newDummyBackendQueue()
@@ -116,8 +117,9 @@ func NewChannel(topicName string, channelName string, ctx *context,
 			ctx.l)
 	}
 
+// 这里的messagePump没有用waitGroup等待，因为随时停止pump不会丢失消息
 	go c.messagePump()
-
+// incoming发送到memory或backendQueue
 	c.waitGroup.Wrap(func() { c.router() })
 	c.waitGroup.Wrap(func() { c.deferredWorker() })
 	c.waitGroup.Wrap(func() { c.inFlightWorker() })
@@ -128,9 +130,15 @@ func NewChannel(topicName string, channelName string, ctx *context,
 }
 
 func (c *Channel) initPQ() {
+	// 优先级队列的长度是内存队列长度的十分之一
 	pqSize := int(math.Max(1, float64(c.ctx.nsqd.opts.MemQueueSize)/10))
 
+// inFlight是自行实现的小根堆，deferred是heap库实现的小根堆，要用两种不同的实现的原因：
+// deferred队列不应该改变原有message的任何东西，因此只能在外附加一层pri和index用来实现优先级排序
+
+// 内存中的message，message结构自身含有优先级
 	c.inFlightMessages = make(map[MessageID]*Message)
+// 延迟的队列，消息加上pqueue.Item优先级
 	c.deferredMessages = make(map[MessageID]*pqueue.Item)
 
 	c.inFlightMutex.Lock()
@@ -167,12 +175,15 @@ func (c *Channel) exit(deleted bool) error {
 
 		// since we are explicitly deleting a channel (not just at system exit time)
 		// de-register this from the lookupd
+
+		// Notify和从lookupd解除注册有什么关系？
 		go c.ctx.nsqd.Notify(c)
 	} else {
 		c.ctx.l.Output(2, fmt.Sprintf("CHANNEL(%s): closing", c.name))
 	}
 
 	// this forceably closes client connections
+	// 关闭所有连接到channel的client
 	c.RLock()
 	for _, client := range c.clients {
 		client.Close()
@@ -209,6 +220,8 @@ func (c *Channel) Empty() error {
 		client.Empty()
 	}
 
+// 排空clientChan和memoryChan
+	// 从nil管道读取会堵塞。not ok：管道已经关闭
 	clientMsgChan := c.clientMsgChan
 	for {
 		select {
@@ -238,6 +251,8 @@ func (c *Channel) flush() error {
 	for msg := range c.clientMsgChan {
 		c.ctx.l.Output(2, fmt.Sprintf(
 			"CHANNEL(%s): recovered buffered message from clientMsgChan", c.name))
+
+		// 带缓冲的调用backend的Put方法，写入backend
 		writeMessageToBackend(&msgBuf, msg, c.backend)
 	}
 
@@ -334,6 +349,9 @@ func (c *Channel) PutMessage(msg *Message) error {
 	return nil
 }
 
+// 下面的Touch, Finish和Requeue都未在channel自身调用，是提供给外部的接口。何时调用要看来自remote的消息。
+
+// 从InFlight取出msg，改变其pri并放回InFlight（字典和PQ）
 // TouchMessage resets the timeout for an in-flight message
 func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
 	msg, err := c.popInFlightMessage(clientID, id)
@@ -358,6 +376,8 @@ func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout ti
 	return nil
 }
 
+// 消息处理完毕，从InFlight中移除
+// 这个消息是remote给出的，如果在inFlightWorker的defaultWorkerWait毫秒超时之前没有收到FIN，那么inFlightWorker就会看到这个消息并把它标记为超时
 // FinishMessage successfully discards an in-flight message
 func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 	msg, err := c.popInFlightMessage(clientID, id)
@@ -371,6 +391,7 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 	return nil
 }
 
+// 主动requeue一个消息，如果timeout设为0则直接Requeue，否则放入deferred队列。
 // RequeueMessage requeues a message based on `time.Duration`, ie:
 //
 // `timeoutMs` == 0 - requeue a message immediately
@@ -393,6 +414,8 @@ func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Dura
 	return c.StartDeferredTimeout(msg, timeout)
 }
 
+// 客户端链接的增删，也是线程安全的map操作
+
 // AddClient adds a client to the Channel's client list
 func (c *Channel) AddClient(clientID int64, client Consumer) {
 	c.Lock()
@@ -405,6 +428,7 @@ func (c *Channel) AddClient(clientID int64, client Consumer) {
 	c.clients[clientID] = client
 }
 
+// 远端关闭连接的时候，client从channel中移除
 // RemoveClient removes a client from the Channel's client list
 func (c *Channel) RemoveClient(clientID int64) {
 	c.Lock()
@@ -421,6 +445,10 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 }
 
+// 链接channel和protocol的入口函数，这里开始，msg绑定了client，拥有了优先级和deliverTS。
+// 完成信息补充后，msg被添加到InFlight字典和InFlight优先级队列中（为何要有两套呢？优先级队列也拥有msg的全部信息）
+// 答案：字典是用作判断消息是否已经入队列的hash，判断有无的复杂度O(1)，PQ是选择优先级最高的消息，排序复杂度O(log(n))。
+// inFlight dict的新增使用msgID做key，删除同理并校验clientID。inFlight PQ的增删传入message，内部使用message结构预留的index做线型索引。
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
 	now := time.Now()
 	msg.clientID = clientID
@@ -434,8 +462,11 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 	return nil
 }
 
+// deferred与InFlight相比，除了消息自身的优先级外又附加了新的优先级，同样是UNIXnano时间戳+timeout值。
+// 这里因为msg外围新包裹了内容，因此容器类型也变成了*pqueue.Item
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
+	// wrap成为Item类型
 	item := &pqueue.Item{Value: msg, Priority: absTs}
 	err := c.pushDeferredMessage(item)
 	if err != nil {
@@ -444,6 +475,8 @@ func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) erro
 	c.addToDeferredPQ(item)
 	return nil
 }
+
+// 把来自InFlight或者deferred队列的消息移动回incoming队列
 
 // doRequeue performs the low level operations to requeue a message
 func (c *Channel) doRequeue(msg *Message) error {
@@ -456,6 +489,8 @@ func (c *Channel) doRequeue(msg *Message) error {
 	atomic.AddUint64(&c.requeueCount, 1)
 	return nil
 }
+
+// 以下7个函数，原子性操作了InFlight和deferred字典和优先级队列(字典的增加/删除，自实现PQ的add和remove，heap实现PQ的add)
 
 // pushInFlightMessage atomically adds a message to the in-flight dictionary
 func (c *Channel) pushInFlightMessage(msg *Message) error {
@@ -470,6 +505,7 @@ func (c *Channel) pushInFlightMessage(msg *Message) error {
 	return nil
 }
 
+// 从inFlight队列删除时会校验传入的clientID与消息是否匹配，只有匹配才能移除
 // popInFlightMessage atomically removes a message from the in-flight dictionary
 func (c *Channel) popInFlightMessage(clientID int64, id MessageID) (*Message, error) {
 	c.Lock()
@@ -507,6 +543,7 @@ func (c *Channel) removeFromInFlightPQ(msg *Message) {
 func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
 	c.Lock()
 	defer c.Unlock()
+// 取msgID之前要先转换回message类型
 
 	// TODO: these map lookups are costly
 	id := item.Value.(*Message).ID
@@ -533,10 +570,11 @@ func (c *Channel) popDeferredMessage(id MessageID) (*pqueue.Item, error) {
 	return item, nil
 }
 
+// 为什么这里插入了deferredPQ但是没看到删除：PeekAndShift在PQ内部实现为public函数了
 func (c *Channel) addToDeferredPQ(item *pqueue.Item) {
 	c.deferredMutex.Lock()
 	defer c.deferredMutex.Unlock()
-
+	// 直接用heap库，内部就不用自己sift了
 	heap.Push(&c.deferredPQ, item)
 }
 
@@ -607,6 +645,7 @@ exit:
 }
 
 func (c *Channel) deferredWorker() {
+	// 见下面pqWorker注释
 	c.pqWorker(&c.deferredPQ, &c.deferredMutex, func(item *pqueue.Item) {
 		msg := item.Value.(*Message)
 		_, err := c.popDeferredMessage(msg.ID)
@@ -617,6 +656,8 @@ func (c *Channel) deferredWorker() {
 	})
 }
 
+// 取得最高优先级的Inflightmsg
+// 理论上如果remote处理消息足够快，所有消息都会在defaultWorkerWait的时间内收到FIN并从inFlight移除，不会进入这个处理
 func (c *Channel) inFlightWorker() {
 	ticker := time.NewTicker(defaultWorkerWait)
 	for {
@@ -628,6 +669,7 @@ func (c *Channel) inFlightWorker() {
 		now := time.Now().UnixNano()
 		for {
 			c.inFlightMutex.Lock()
+			// 取优先级队列0元素，now在这里用来判断有效性，如果0元素的pri比now还大，就返回nil
 			msg, _ := c.inFlightPQ.PeekAndShift(now)
 			c.inFlightMutex.Unlock()
 
@@ -639,11 +681,15 @@ func (c *Channel) inFlightWorker() {
 			if err != nil {
 				break
 			}
+		// 只要有InFlight消息，timeout计数就+1，而且会把消息Requeue：只要这里拿到的，就是超时的，需要重新计算pri并排队
+		// 未超时的都已经取走了
 			atomic.AddUint64(&c.timeoutCount, 1)
 			c.RLock()
 			client, ok := c.clients[msg.clientID]
 			c.RUnlock()
 			if ok {
+				// 有client绑定的消息，通知client修改inFlight计数器。
+				// not ok的情况：处理这个消息的remote关闭了连接，IOLoop移除client并退出。
 				client.TimedOutMessage()
 			}
 			c.doRequeue(msg)
@@ -654,6 +700,10 @@ exit:
 	c.ctx.l.Output(2, fmt.Sprintf("CHANNEL(%s): closing ... inFlightWorker", c.name))
 	ticker.Stop()
 }
+
+
+// deferred队列中的消息和inFlight中超时的消息处理类似，但使用callback来决定这些消息最后怎么办，而不是统一requeue了事。
+// 虽然deferredWorker最终提供的cb函数就是个Requeue，好吧。。。
 
 // generic loop (executed in a goroutine) that periodically wakes up to walk
 // the priority queue and call the callback

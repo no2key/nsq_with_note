@@ -55,3 +55,5 @@ func (p *PostParams) Get(key string) (string, error) {
 	}
 	return "", errors.New("key not in post params")
 }
+
+// 解析http request 封装成struct

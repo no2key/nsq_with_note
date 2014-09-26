@@ -40,7 +40,7 @@ func (p *tcpServer) Handle(clientConn net.Conn) {
 			"ERROR: client(%s) bad protocol magic '%s'", clientConn.RemoteAddr(), protocolMagic))
 		return
 	}
-
+// TCP server检查前4个字节，并加载protocolV2 struct，该结构实现了protocol的IOLoop接口，最终调用IOLoop方法。
 	err = prot.IOLoop(clientConn)
 	if err != nil {
 		p.ctx.l.Output(2, fmt.Sprintf("ERROR: client(%s) - %s", clientConn.RemoteAddr(), err))

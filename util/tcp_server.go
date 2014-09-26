@@ -33,3 +33,6 @@ func TCPServer(listener net.Listener, handler TCPHandler, l logger) {
 
 	l.Output(2, fmt.Sprintf("TCP: closing %s", listener.Addr()))
 }
+
+
+// Accept listener请求转给handler处理

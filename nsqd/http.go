@@ -24,6 +24,7 @@ type httpServer struct {
 	tlsRequired bool
 }
 
+// 尝试依次用V1，deprecated和debug三种路由处理方式处理http请求
 func (s *httpServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !s.tlsEnabled && s.tlsRequired {
 		util.ApiResponse(w, 403, "TLS_REQUIRED", nil)
@@ -74,8 +75,17 @@ func (s *httpServer) debugRouter(w http.ResponseWriter, req *http.Request) error
 func (s *httpServer) v1Router(w http.ResponseWriter, req *http.Request) error {
 	switch req.URL.Path {
 	case "/pub":
-		util.NegotiateAPIResponseWrapper(w, req, util.POSTRequired(req,
-			func() (interface{}, error) { return s.doPUB(req) }))
+		util.NegotiateAPIResponseWrapper(
+			w, 
+			req, 
+			util.POSTRequired(
+				req,
+				func() (interface{}, error) { 
+					return s.doPUB(req) 
+				}
+				// 闭包，有何意义？
+			)
+		)
 	case "/mpub":
 		util.NegotiateAPIResponseWrapper(w, req, util.POSTRequired(req,
 			func() (interface{}, error) { return s.doMPUB(req) }))
@@ -186,6 +196,7 @@ func (s *httpServer) doInfo(req *http.Request) (interface{}, error) {
 	}, nil
 }
 
+// 带/不带创建的由request返回topic
 func (s *httpServer) getExistingTopicFromQuery(req *http.Request) (*util.ReqParams, *Topic, string, error) {
 	reqParams, err := util.NewReqParams(req)
 	if err != nil {
@@ -226,6 +237,7 @@ func (s *httpServer) getTopicFromQuery(req *http.Request) (url.Values, *Topic, e
 	return reqParams, s.ctx.nsqd.GetTopic(topicName), nil
 }
 
+// 向topic写数据：从idChan得到msgID，加上消息体，PutMessage
 func (s *httpServer) doPUB(req *http.Request) (interface{}, error) {
 	// TODO: one day I'd really like to just error on chunked requests
 	// to be able to fail "too big" requests before we even read
@@ -253,7 +265,7 @@ func (s *httpServer) doPUB(req *http.Request) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-
+// 取得一个guid，加上body消息内容生成message并放入topic中，返回OK。
 	msg := NewMessage(<-s.ctx.nsqd.idChan, body)
 	err = topic.PutMessage(msg)
 	if err != nil {
@@ -333,6 +345,8 @@ func (s *httpServer) doMPUB(req *http.Request) (interface{}, error) {
 	return "OK", nil
 }
 
+// req中解析得到topic信息，对其进行有效性判断后进行create/empty/delete/pause等操作
+// 内部调用了GetTopic，对不存在的topic进行了创建
 func (s *httpServer) doCreateTopic(req *http.Request) (interface{}, error) {
 	_, _, err := s.getTopicFromQuery(req)
 	return nil, err
@@ -417,6 +431,7 @@ func (s *httpServer) doPauseTopic(req *http.Request) (interface{}, error) {
 	return nil, nil
 }
 
+// req中解析得到topic和channel信息，对其进行有效性判断后进行create/empty/delete/pause等操作
 func (s *httpServer) doCreateChannel(req *http.Request) (interface{}, error) {
 	_, topic, channelName, err := s.getExistingTopicFromQuery(req)
 	if err != nil {
@@ -483,6 +498,7 @@ func (s *httpServer) doPauseChannel(req *http.Request) (interface{}, error) {
 	return nil, nil
 }
 
+// 返回stats信息
 func (s *httpServer) doStats(req *http.Request) (interface{}, error) {
 	reqParams, err := util.NewReqParams(req)
 	if err != nil {

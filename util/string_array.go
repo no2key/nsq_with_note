@@ -14,3 +14,5 @@ func (a *StringArray) Set(s string) error {
 func (a *StringArray) String() string {
 	return strings.Join(*a, ",")
 }
+
+// 封装关于string数组的方法使其满足一些接口

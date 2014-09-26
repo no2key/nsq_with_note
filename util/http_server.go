@@ -21,3 +21,5 @@ func HTTPServer(listener net.Listener, handler http.Handler, l logger, proto str
 
 	l.Output(2, fmt.Sprintf("%s: closing %s", proto, listener.Addr()))
 }
+
+// 使用handler serve来自listener的请求

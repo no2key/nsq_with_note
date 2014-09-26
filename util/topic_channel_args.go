@@ -29,3 +29,5 @@ func GetTopicChannelArgs(rp Getter) (string, string, error) {
 
 	return topicName, channelName, nil
 }
+
+// 从reqParam中取得topic和channel名称

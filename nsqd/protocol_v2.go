@@ -46,10 +46,13 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	// goroutine local state derived from client attributes
 	// and avoid a potential race with IDENTIFY (where a client
 	// could have changed or disabled said attributes)
+
+	// 使用chan同步的理由：在identity之前填充一些数据
 	messagePumpStartedChan := make(chan bool)
 	go p.messagePump(client, messagePumpStartedChan)
 	<-messagePumpStartedChan
 
+// 对同一个客户端的请求，用单线程处理，依据param分发
 	for {
 		if client.HeartbeatInterval > 0 {
 			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2))
@@ -79,6 +82,8 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		response, err := p.Exec(client, params)
 		if err != nil {
 			ctx := ""
+			// 将错误转换为util.ChildErr接口类型，然后取得其父级err
+			// Client格式，parentErr, code, desc ... 实现了ChildErr接口
 			if parentErr := err.(util.ChildErr).Parent(); parentErr != nil {
 				ctx = " - " + parentErr.Error()
 			}
@@ -144,6 +149,7 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 		client.SetWriteDeadline(zeroTime)
 	}
 
+// FramedResponse 在包头添加frame信息，有response, error, message三种类型
 	_, err := util.SendFramedResponse(client.Writer, frameType, data)
 	if err != nil {
 		client.Unlock()
@@ -222,6 +228,8 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	// that we've started up
 	close(startedChan)
 
+// 三种情形，未就绪、就绪已刷新、就绪未刷新
+// 未就绪：强制刷新client，已刷新：不启动刷新计时器，未刷新：启动刷新计时器
 	for {
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
@@ -238,12 +246,16 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 		} else if flushed {
 			// last iteration we flushed...
 			// do not select on the flusher ticker channel
+		// 接过channel的输出管道
 			clientMsgChan = subChannel.clientMsgChan
 			flusherChan = nil
 		} else {
 			// we're buffered (if there isn't any more data we should flush)...
 			// select on the flusher ticker channel, too
+		// 接过channel的输出管道
 			clientMsgChan = subChannel.clientMsgChan
+
+	// flush的计时器是在identify时候根据outputBuffer的过期时间设定的
 			flusherChan = outputBufferTicker.C
 		}
 
@@ -259,7 +271,11 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 				goto exit
 			}
 			flushed = true
+
+// client计数器有更新了，什么都不做？
 		case <-client.ReadyStateChan:
+
+// sub和identify都在首次读取后设置成nil，后来的信息就被丢弃了
 		case subChannel = <-subEventChan:
 			// you can't SUB anymore
 			subEventChan = nil
@@ -284,22 +300,28 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			}
 
 			msgTimeout = identifyData.MsgTimeout
+// 定期心跳，计时器是identify时设定的
 		case <-heartbeatChan:
 			err = p.Send(client, frameTypeResponse, heartbeatBytes)
 			if err != nil {
 				goto exit
 			}
+// 处理消息，不包含sub/identify/flush
 		case msg, ok := <-clientMsgChan:
 			if !ok {
 				goto exit
 			}
-
+		// 一定的概率在本轮不处理消息
 			if sampleRate > 0 && rand.Int31n(100) > sampleRate {
 				continue
 			}
+		// 下面三步完成了消息由channel向remote的传递
 
+		// 准备向remote发送消息时将message标记为inFlight，超时值是供channel设置消息优先级的
 			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
+		// 更新client计数器
 			client.SendingMessage()
+		// 真正向remote发送消息
 			err = p.SendMessage(client, msg, &buf)
 			if err != nil {
 				goto exit
@@ -513,7 +535,7 @@ func (p *protocolV2) AUTH(client *clientV2, params [][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, util.NewFatalClientErr(err, "E_AUTH_ERROR", "AUTH error "+err.Error())
 	}
-
+// 读取remote的auth数据，校验并返回
 	err = p.Send(client, frameTypeResponse, resp)
 	if err != nil {
 		return nil, util.NewFatalClientErr(err, "E_AUTH_ERROR", "AUTH error "+err.Error())
@@ -523,6 +545,7 @@ func (p *protocolV2) AUTH(client *clientV2, params [][]byte) ([]byte, error) {
 
 }
 
+// 在AUTH完成之后，其他类型的命令调用这里判断是否通过了AUTH
 func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName string) error {
 	// if auth is enabled, the client must have authorized already
 	// compare topic/channel against cached authorization data (refetching if expired)
@@ -574,11 +597,13 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, err
 	}
 
+// SUB会为channel增加client，一个channel可以同时有多个remote client处理它的消息。
 	topic := p.ctx.nsqd.GetTopic(topicName)
 	channel := topic.GetChannel(channelName)
 	channel.AddClient(client.ID, client)
 
 	atomic.StoreInt32(&client.State, stateSubscribed)
+// 设置client的channel，从此remote只处理这个channel的消息
 	client.Channel = channel
 	// update message pump
 	client.SubEventChan <- channel
@@ -586,6 +611,7 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+// 从remote接收ready值，并设置到client。表示可以发送多少新消息到remote
 func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 
@@ -622,6 +648,7 @@ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+// 每次remote处理完一个消息应该发送FIN告知处理完成
 func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
@@ -637,17 +664,19 @@ func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, util.NewFatalClientErr(nil, "E_INVALID", err.Error())
 	}
 
+// 由channel进行finish处理
 	err = client.Channel.FinishMessage(client.ID, *id)
 	if err != nil {
 		return nil, util.NewClientErr(err, "E_FIN_FAILED",
 			fmt.Sprintf("FIN %s failed %s", *id, err.Error()))
 	}
-
+// 实质性的操作发生在channel中，client只是更新一下计数器
 	client.FinishedMessage()
 
 	return nil, nil
 }
 
+// REQ是requeue而不是request的意思，remote没能成功消费掉消息时发送REQ命令。
 func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
@@ -690,7 +719,7 @@ func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
 	if atomic.LoadInt32(&client.State) != stateSubscribed {
 		return nil, util.NewFatalClientErr(nil, "E_INVALID", "cannot CLS in current state")
 	}
-
+	// 清空readycount
 	client.StartClose()
 
 	return []byte("CLOSE_WAIT"), nil
@@ -737,7 +766,7 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if err := p.CheckAuth(client, "PUB", topicName, ""); err != nil {
 		return nil, err
 	}
-
+// 接收到PUB消息，交给topic进行分发
 	topic := p.ctx.nsqd.GetTopic(topicName)
 	msg := NewMessage(<-p.ctx.nsqd.idChan, messageBody)
 	err = topic.PutMessage(msg)
@@ -867,6 +896,8 @@ func readMPUB(r io.Reader, tmp []byte, idChan chan MessageID, maxMessageSize int
 	return messages, nil
 }
 
+// 把bytes转换为messageID格式，指针转换，有什么意义？
+// http://nsq.io/overview/internals.html TCP protocol小节：减少[]byte到string的转换，减轻GC压力
 // validate and cast the bytes on the wire to a message ID
 func getMessageId(p []byte) (*MessageID, error) {
 	if len(p) != MsgIDLength {
@@ -875,6 +906,7 @@ func getMessageId(p []byte) (*MessageID, error) {
 	return (*MessageID)(unsafe.Pointer(&p[0])), nil
 }
 
+// 辅助函数，消息的首4字节储存消息体长度
 func readLen(r io.Reader, tmp []byte) (int32, error) {
 	_, err := io.ReadFull(r, tmp)
 	if err != nil {

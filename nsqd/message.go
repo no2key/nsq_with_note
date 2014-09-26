@@ -33,6 +33,7 @@ func NewMessage(id MessageID, body []byte) *Message {
 	}
 }
 
+// 消息的序列化与反序列化
 func (m *Message) WriteTo(w io.Writer) (int64, error) {
 	var buf [10]byte
 	var total int64

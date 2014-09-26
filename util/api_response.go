@@ -24,6 +24,9 @@ func acceptVersion(req *http.Request) int {
 	return 0
 }
 
+// 装饰器：必须使用POST
+// 参数传入（req和一个（返回数据和错误的）函数），返回一个（返回数据和错误的）函数。
+// 实质是根据req返回原有函数，或返回405错误函数。
 func POSTRequired(req *http.Request, f func() (interface{}, error)) func() (interface{}, error) {
 	if req.Method != "POST" {
 		return func() (interface{}, error) {
@@ -33,6 +36,7 @@ func POSTRequired(req *http.Request, f func() (interface{}, error)) func() (inte
 	return f
 }
 
+// 包装器：传入req和response和处理二者关系用的func，先用func处理req，根据处理后req的特征决定返回何种response（V1Api或Api）
 func NegotiateAPIResponseWrapper(w http.ResponseWriter, req *http.Request, f func() (interface{}, error)) {
 	data, err := f()
 	if err != nil {
@@ -51,6 +55,7 @@ func NegotiateAPIResponseWrapper(w http.ResponseWriter, req *http.Request, f fun
 	}
 }
 
+// 包装器：返回V1Api格式的response
 func V1APIResponseWrapper(w http.ResponseWriter, req *http.Request, f func() (interface{}, error)) {
 	data, err := f()
 	if err != nil {
@@ -60,6 +65,8 @@ func V1APIResponseWrapper(w http.ResponseWriter, req *http.Request, f func() (in
 	V1ApiResponse(w, 200, data)
 }
 
+
+// API响应格式
 func ApiResponse(w http.ResponseWriter, statusCode int, statusTxt string, data interface{}) {
 	var response []byte
 	var err error
@@ -90,6 +97,7 @@ func ApiResponse(w http.ResponseWriter, statusCode int, statusTxt string, data i
 	w.Write(response)
 }
 
+// V1Api响应格式
 func V1ApiResponse(w http.ResponseWriter, code int, data interface{}) {
 	var response []byte
 	var err error
